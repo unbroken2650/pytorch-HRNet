@@ -10,12 +10,10 @@ PRINT_FREQ: 10
 
 DATASET:
   DATASET: coco2017
-  ROOT: "../../../../mnt/sda/suhohan/"
-  TEST_SET: "val.lst"
-  TRAIN_SET: "train.lst"
+  ROOT: "../../../../mnt/sda/suhohan/coco2017"
   NUM_CLASSES: 150
 MODEL:
-  NAME: seg_hrnet_ocr
+  NAME: hrnet
   NUM_OUTPUTS: 2
   PRETRAINED: "../../../../dataset/pretrained_models/HRNet_W48_C_ssld_pretrained.pth"
   EXTRA:
@@ -75,9 +73,9 @@ LOSS:
   BALANCE_WEIGHTS: [0.4, 1]
 TRAIN:
   IMAGE_SIZE:
-    - 520
-    - 520
-  BASE_SIZE: 520
+    - 512
+    - 512
+  BASE_SIZE: 512
   BATCH_SIZE_PER_GPU: 2
   SHUFFLE: true
   BEGIN_EPOCH: 0
@@ -95,9 +93,9 @@ TRAIN:
   SCALE_FACTOR: 16
 TEST:
   IMAGE_SIZE:
-    - 520
-    - 520
-  BASE_SIZE: 520
+    - 512
+    - 512
+  BASE_SIZE: 512
   BATCH_SIZE_PER_GPU: 1
   NUM_SAMPLES: 200
   FLIP_TEST: false

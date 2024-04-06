@@ -1,6 +1,8 @@
 import argparse
 import os
 import pprint
+from PIL import Image
+from pycocotools.coco import COCO
 
 import logging
 import time
@@ -12,7 +14,8 @@ import torch
 import torch.nn as nn
 import torch.backends.cudnn as cudnn
 import torch.optim
-from torchvision import datasets, transforms
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
 from tensorboardX import SummaryWriter
 
 import _init_paths
@@ -42,13 +45,60 @@ def parse_args():
     return args
 
 
-def get_sampler(dataset):
-    from utils.distributed import is_distributed
-    if is_distributed():
-        from torch.utils.data.distributed import DistributedSampler
-        return DistributedSampler(dataset)
-    else:
-        return None
+# def get_sampler(dataset):
+#     from utils.distributed import is_distributed
+#     if is_distributed():
+#         from torch.utils.data.distributed import DistributedSampler
+#         return DistributedSampler(dataset)
+#     else:
+#         return None
+
+class ResizeTransform:
+    def __init__(self, size):
+        self.size = size
+        self.resize_transform = transforms.Compose([
+            transforms.Resize(self.size),
+            transforms.ToTensor(),
+        ])
+
+    def __call__(self, image, mask):
+        image = self.resize_transform(image)
+        mask = self.resize_transform(mask)
+        return image, mask
+
+
+class COCODataset(Dataset):
+    def __init__(self, root_dir, mode, image_size):
+
+        self.root_dir = root_dir
+        self.data_dir = os.path.join(self.root_dir, f'{mode}2017')
+        annotation_file = '{}/annotations/instances_{}2017.json'.format(self.root_dir, mode)
+        self.transform = ResizeTransform((image_size, image_size))
+        self.image_files = [f for f in os.listdir(self.data_dir) if os.path.isfile(os.path.join(self.data_dir, f))]
+        self.coco = COCO(annotation_file)
+        self.ids = list(sorted(self.coco.imgs.keys()))
+
+    def __len__(self):
+        return len(self.image_files)
+
+    def __getitem__(self, idx):
+        img_id = self.ids[idx]
+        img_info = self.coco.loadImgs(img_id)[0]
+        img_path = os.path.join(self.data_dir, img_info['file_name'])
+        image = Image.open(img_path).convert('RGB')
+
+        ann_ids = self.coco.getAnnIds(imgIds=img_id)
+        anns = self.coco.loadAnns(ann_ids)
+        mask = np.zeros((img_info['height'], img_info['width']))
+        for ann in anns:
+            mask = np.maximum(self.coco.annToMask(ann) * ann['category_id'], mask)
+
+        mask = Image.fromarray(mask)
+
+        if self.transform:
+            image, mask = self.transform(image, mask)
+
+        return image, mask
 
 
 def main():
@@ -86,50 +136,18 @@ def main():
         this_dir = os.path.dirname(__file__)
         models_dst_dir = os.path.join(final_output_dir, 'models')
 
-    # batch size
+    # dataset
     batch_size = config.TRAIN.BATCH_SIZE_PER_GPU
 
-    # prepare data
-    train_transform = transforms.Compose([
-        # 여기에 필요한 전처리 단계 추가
-        transforms.Resize((config.TRAIN.IMAGE_SIZE[0], config.TRAIN.IMAGE_SIZE[1])),
-        transforms.ToTensor(),
-    ])
-    test_transform = transforms.Compose([
-        # 여기에 필요한 전처리 단계 추가
-        transforms.Resize((config.TEST.IMAGE_SIZE[0], config.TEST.IMAGE_SIZE[1])),
-        transforms.ToTensor(),
-    ])
-
-    train_dataset = datasets.ImageFolder(
-        root=config.DATASET.ROOT + '/train2017',
-        transform=train_transform
-    )
-    test_dataset = datasets.ImageFolder(
-        root=config.DATASET.ROOT + '/test2017',
-        transform=test_transform
-    )
-
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=config.WORKERS
-    )
-
-    test_loader = torch.utils.data.DataLoader(
-        test_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=config.WORKERS
-    )
+    train_dataset = COCODataset(root_dir=config.DATASET.ROOT, mode='train', image_size=config.TRAIN.IMAGE_SIZE[0])
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=config.WORKERS)
 
     # criterion
     if config.LOSS.USE_OHEM:
-        criterion = OhemCrossEntropy(ignore_label=config.TRAIN.IGNORE_LABEL, thres=config.LOSS.OHEMTHRES,
-                                     min_kept=config.LOSS.OHEMKEEP, weight=train_dataset.class_weights)
+        criterion = OhemCrossEntropy(ignore_label=config.TRAIN.IGNORE_LABEL,
+                                     thres=config.LOSS.OHEMTHRES, min_kept=config.LOSS.OHEMKEEP)
     else:
-        criterion = CrossEntropy(ignore_label=config.TRAIN.IGNORE_LABEL, weight=train_dataset.class_weights)
+        criterion = CrossEntropy(ignore_label=config.TRAIN.IGNORE_LABEL)
 
     model = FullModel(model, criterion)
 
@@ -173,8 +191,7 @@ def main():
     else:
         raise ValueError('Only Support SGD optimizer')
 
-    epoch_iters = np.int(train_dataset.__len__() /
-                         config.TRAIN.BATCH_SIZE_PER_GPU / len(gpus))
+    epoch_iters = int(train_dataset.__len__() / config.TRAIN.BATCH_SIZE_PER_GPU / len(gpus))
 
     best_mIoU = 0
     last_epoch = 0
@@ -196,49 +213,38 @@ def main():
             torch.distributed.barrier()
 
     start = timeit.default_timer()
-    # end_epoch = config.TRAIN.END_EPOCH + config.TRAIN.EXTRA_EPOCH
-    # num_iters = config.TRAIN.END_EPOCH * epoch_iters
-    # extra_iters = config.TRAIN.EXTRA_EPOCH * extra_epoch_iters
+    end_epoch = config.TRAIN.END_EPOCH + config.TRAIN.EXTRA_EPOCH
+    num_iters = config.TRAIN.END_EPOCH * epoch_iters
 
-    # for epoch in range(last_epoch, end_epoch):
+    for epoch in range(last_epoch, end_epoch):
+        print("current epoch: ", epoch)
+        current_trainloader = train_loader
+        if current_trainloader.sampler is not None and hasattr(current_trainloader.sampler, 'set_epoch'):
+            current_trainloader.sampler.set_epoch(epoch)
 
-    #     current_trainloader = extra_trainloader if epoch >= config.TRAIN.END_EPOCH else trainloader
-    #     if current_trainloader.sampler is not None and hasattr(current_trainloader.sampler, 'set_epoch'):
-    #         current_trainloader.sampler.set_epoch(epoch)
+        train(config, epoch, config.TRAIN.END_EPOCH,
+              epoch_iters, config.TRAIN.LR, num_iters,
+              train_loader, optimizer, model, writer_dict)
 
-    #     # valid_loss, mean_IoU, IoU_array = validate(config,
-    #     #             testloader, model, writer_dict)
+        # valid_loss, mean_IoU, IoU_array = validate(config, test_loader, model, writer_dict)
 
-    #     if epoch >= config.TRAIN.END_EPOCH:
-    #         train(config, epoch-config.TRAIN.END_EPOCH,
-    #               config.TRAIN.EXTRA_EPOCH, extra_epoch_iters,
-    #               config.TRAIN.EXTRA_LR, extra_iters,
-    #               extra_trainloader, optimizer, model, writer_dict)
-    #     else:
-    #         train(config, epoch, config.TRAIN.END_EPOCH,
-    #               epoch_iters, config.TRAIN.LR, num_iters,
-    #               trainloader, optimizer, model, writer_dict)
-
-    #     valid_loss, mean_IoU, IoU_array = validate(config,
-    #                                                testloader, model, writer_dict)
-
-    #     if args.local_rank <= 0:
-    #         logger.info('=> saving checkpoint to {}'.format(
-    #             final_output_dir + 'checkpoint.pth.tar'))
-    #         torch.save({
-    #             'epoch': epoch+1,
-    #             'best_mIoU': best_mIoU,
-    #             'state_dict': model.module.state_dict(),
-    #             'optimizer': optimizer.state_dict(),
-    #         }, os.path.join(final_output_dir, 'checkpoint.pth.tar'))
-    #         if mean_IoU > best_mIoU:
-    #             best_mIoU = mean_IoU
-    #             torch.save(model.module.state_dict(),
-    #                        os.path.join(final_output_dir, 'best.pth'))
-    #         msg = 'Loss: {:.3f}, MeanIU: {: 4.4f}, Best_mIoU: {: 4.4f}'.format(
-    #             valid_loss, mean_IoU, best_mIoU)
-    #         logging.info(msg)
-    #         logging.info(IoU_array)
+        # if args.local_rank <= 0:
+        #     logger.info('=> saving checkpoint to {}'.format(
+        #         final_output_dir + 'checkpoint.pth.tar'))
+        #     torch.save({
+        #         'epoch': epoch+1,
+        #         'best_mIoU': best_mIoU,
+        #         'state_dict': model.module.state_dict(),
+        #         'optimizer': optimizer.state_dict(),
+        #     }, os.path.join(final_output_dir, 'checkpoint.pth.tar'))
+        #     if mean_IoU > best_mIoU:
+        #         best_mIoU = mean_IoU
+        #         torch.save(model.module.state_dict(),
+        #                    os.path.join(final_output_dir, 'best.pth'))
+        #     msg = 'Loss: {:.3f}, MeanIU: {: 4.4f}, Best_mIoU: {: 4.4f}'.format(
+        #         valid_loss, mean_IoU, best_mIoU)
+        #     logging.info(msg)
+        #     logging.info(IoU_array)
 
     if args.local_rank <= 0:
 
