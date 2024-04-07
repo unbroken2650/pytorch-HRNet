@@ -142,14 +142,14 @@ def main():
     train_dataset = COCODataset(root_dir=config.DATASET.ROOT, mode='train', image_size=config.TRAIN.IMAGE_SIZE[0])
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=config.WORKERS)
 
-    # criterion
-    if config.LOSS.USE_OHEM:
-        criterion = OhemCrossEntropy(ignore_label=config.TRAIN.IGNORE_LABEL,
-                                     thres=config.LOSS.OHEMTHRES, min_kept=config.LOSS.OHEMKEEP)
-    else:
-        criterion = CrossEntropy(ignore_label=config.TRAIN.IGNORE_LABEL)
+    # # criterion
+    # if config.LOSS.USE_OHEM:
+    #     criterion = OhemCrossEntropy(ignore_label=config.TRAIN.IGNORE_LABEL,
+    #                                  thres=config.LOSS.OHEMTHRES, min_kept=config.LOSS.OHEMKEEP)
+    # else:
+    #     criterion = CrossEntropy(ignore_label=config.TRAIN.IGNORE_LABEL)
 
-    model = FullModel(model, criterion)
+    # model = FullModel(model, criterion)
 
     if distributed:
         model = model.to(device)
@@ -193,7 +193,6 @@ def main():
 
     epoch_iters = int(train_dataset.__len__() / config.TRAIN.BATCH_SIZE_PER_GPU / len(gpus))
 
-    best_mIoU = 0
     last_epoch = 0
     if config.TRAIN.RESUME:
         model_state_file = os.path.join(final_output_dir,

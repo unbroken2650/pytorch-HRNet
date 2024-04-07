@@ -19,13 +19,14 @@ def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
 class BasicBlock(nn.Module):
     expansion = 1
 
-    def __init__(self, inplanes, planes, stride=1, downsample=None):
+    def __init__(self, inplanes, planes, stride=1, downsample=None, groups=1,
+                 base_width=64, dilation=1, norm_layer=None):
         super(BasicBlock, self).__init__()
         self.conv1 = conv3x3(inplanes, planes, stride)
         self.bn1 = nn.BatchNorm2d(planes, momentum=BN_MOMENTUM)
+        self.relu = nn.ReLU(inplace=True)
         self.conv2 = conv3x3(planes, planes)
         self.bn2 = nn.BatchNorm2d(planes, momentum=BN_MOMENTUM)
-        self.relu = nn.ReLU(inplace=True)
         self.downsample = downsample
         self.stride = stride
 
@@ -126,8 +127,9 @@ class HighResolutionModule(nn.Module):
         downsample = None
         if stride != 1 or self.num_inchannels[branch_index] != num_channels[branch_index]*block.expansion:
             downsample = nn.Sequential(
-                nn.Conv2d(self.num_inchannels[branch_index], num_channels[branch_index]
-                          * block.expansion, kernel_size=1, stride=stride, bias=False),
+                nn.Conv2d(self.num_inchannels[branch_index],
+                          num_channels[branch_index] * block.expansion,
+                          kernel_size=1, stride=stride, bias=False),
                 nn.BatchNorm2d(num_channels[branch_index]*block.expansion, momentum=BN_MOMENTUM)
             )
 
@@ -173,7 +175,7 @@ class HighResolutionModule(nn.Module):
                         if k == i - j - 1:
                             num_outchannels_conv3x3 = num_inchannels[i]
                             conv3x3s.append(nn.Sequential(
-                                nn.Conv2d(num_inchannels[i], num_outchannels_conv3x3,
+                                nn.Conv2d(num_inchannels[j], num_outchannels_conv3x3,
                                           kernel_size=3, stride=2, padding=1, bias=False),
                                 nn.BatchNorm2d(num_outchannels_conv3x3, momentum=BN_MOMENTUM)
                             ))
@@ -212,7 +214,7 @@ class HighResolutionModule(nn.Module):
                     y = y + F.interpolate(
                         self.fuse_layers[i][j](x[j]),
                         size=[height_output, width_output],
-                        mode='bilinear', align_corners=ALIGN_CORNERS)
+                        mode='bilinear', align_corners=True)
                 else:
                     y = y + self.fuse_layers[i][j](x[j])
             x_fuse.append(self.relu(y))
@@ -274,12 +276,12 @@ class HighResolutionNet(nn.Module):
         )
 
     def _make_transition_layer(self, channels_pre_layer, channels_cur_layer):
-        num_channels_pre = len(channels_pre_layer)
-        num_channels_cur = len(channels_cur_layer)
+        num_branches_pre = len(channels_pre_layer)
+        num_branches_cur = len(channels_cur_layer)
 
         transition_layers = []
-        for i in range(num_channels_cur):
-            if i < num_channels_pre:  # high Res. -> low Res.
+        for i in range(num_branches_cur):
+            if i < num_branches_pre:  # high Res. -> low Res.
                 if channels_cur_layer[i] != channels_pre_layer[i]:
                     transition_layers.append(
                         nn.Sequential(
@@ -293,12 +295,12 @@ class HighResolutionNet(nn.Module):
                     transition_layers.append(None)
             else:
                 conv3x3s = []
-                for j in range(i+1-num_channels_pre):
+                for j in range(i+1-num_branches_pre):
                     inchannels = channels_pre_layer[-1]
-                    outchannels = channels_cur_layer[i] if j == i-num_channels_pre else inchannels
+                    outchannels = channels_cur_layer[i] if j == i-num_branches_pre else inchannels
                     conv3x3s.append(
                         nn.Sequential(
-                            nn.Conv2d(inchannels, outchannels, kernel_size=3, stride=1, padding=1, bias=False),
+                            nn.Conv2d(inchannels, outchannels, kernel_size=3, stride=2, padding=1, bias=False),
                             nn.BatchNorm2d(outchannels, momentum=BN_MOMENTUM),
                             nn.ReLU(inplace=True)
                         )
@@ -366,24 +368,30 @@ class HighResolutionNet(nn.Module):
         x_list = []
         for i in range(self.stage3_cfg['NUM_BRANCHES']):
             if self.transition2[i] is not None:
-                x_list.append(self.transition2[i](x))
+                if i < self.stage2_cfg['NUM_BRANCHES']:
+                    x_list.append(self.transition2[i](y_list[i]))
+                else:
+                    x_list.append(self.transition2[i](y_list[-1]))
             else:
-                x_list.append(x)
+                x_list.append(y_list[i])
         y_list = self.stage3(x_list)
 
         x_list = []
         for i in range(self.stage4_cfg['NUM_BRANCHES']):
             if self.transition3[i] is not None:
-                x_list.append(self.transition3[i](x))
+                if i < self.stage3_cfg['NUM_BRANCHES']:
+                    x_list.append(self.transition3[i](y_list[i]))
+                else:
+                    x_list.append(self.transition3[i](y_list[-1]))
             else:
-                x_list.append(x)
-        y_list = self.stage4(x_list)
+                x_list.append(y_list[i])
+        x = self.stage4(x_list)
 
         # last layer
         x0_height, x0_width = x[0].size(2), x[0].size(3)
-        x1 = F.interpolate(x[1], size=(x0_height, x0_width), mode='bilinear', align_corners=ALIGN_CORNERS)
-        x2 = F.interpolate(x[2], size=(x0_height, x0_width), mode='bilinear', align_corners=ALIGN_CORNERS)
-        x3 = F.interpolate(x[3], size=(x0_height, x0_width), mode='bilinear', align_corners=ALIGN_CORNERS)
+        x1 = F.interpolate(x[1], size=(x0_height, x0_width), mode='bilinear', align_corners=False)
+        x2 = F.interpolate(x[2], size=(x0_height, x0_width), mode='bilinear', align_corners=False)
+        x3 = F.interpolate(x[3], size=(x0_height, x0_width), mode='bilinear', align_corners=False)
         x = torch.cat([x[0], x1, x2, x3], 1)
         x = self.last_layer(x)
 
