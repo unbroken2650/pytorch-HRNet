@@ -341,7 +341,7 @@ class HighResolutionNet(nn.Module):
 
             modules.append(
                 HighResolutionModule(
-                    num_branches, block, num_blocks, num_channels, num_inchannels,
+                    num_branches, block, num_blocks, num_inchannels, num_channels,
                     fuse_method, reset_multi_scale_output
                 )
             )
